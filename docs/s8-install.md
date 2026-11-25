@@ -23,6 +23,8 @@ adb pull /sdcard/BOOT.img backup/BOOT.img
 
 `backup/BOOT.img` (the stock BOOT) is needed later: it supplies the image header and the DTBH.
 
+Only the header page and the DTBH are used. `tools\dreamlte\get-boot-template.ps1` (phone in TWRP) saves just those parts as a small `boot-template.img` (usually under 1 MB), which works in place of `backup/BOOT.img` below.
+
 ## 2. XNU kernel
 
 The kernel is built on GitHub Actions macOS runners (free for public repositories).
@@ -84,7 +86,7 @@ bash tools/dreamlte/make-boot.sh xnu/out/kernel.development.a5xelte backup/BOOT.
 
 The script builds the ADT (`tools/mkadt_dreamlte.py`) and the payload (`tools/mkpayload.py`), compiles the `shim/dreamlte` loader and packs BOOT with the stock header.
 
-Flash it (phone in TWRP):
+Flash it (phone in TWRP). On Windows, `tools\dreamlte\flash-boot.ps1 s8-ios-boot.img` does the checks below, writes only BOOT, verifies it by SHA-256 and reboots. By hand:
 
 ```bash
 adb push s8-ios-boot.img /tmp/boot.img
@@ -121,9 +123,11 @@ Restore BOOT and Data from the TWRP backup (or `dd` the saved `BOOT.img` back to
 
 | Argument | Purpose |
 | --- | --- |
-| `cpus=N` | How many A53 cores to start (1–4) |
+| `cpus=N` | How many cores to start: 1–4 = A53s, 5–8 adds Mongoose cores (experimental; the loader caps N at 4 + the Mongoose cores its probe started) |
+| `s8mngsdbg=1` | Loader logs the CPU cluster PLLs during the Mongoose probe |
 | `rd=ufsroot0 ufsroot=USERDATA` | Root is the HFS+ volume in USERDATA |
 | `ufsrw=1 rootrw=1` | Root mounted read/write |
+| `sweetfb_hz=N` | Most frames per second copied to the panel (default 10; 30 or 60 for smoother motion, costs CPU) |
 | `sweetfb_native=1` | Present the 1440×2960 panel to iOS (1125×2436 hangs for now) |
 | `a5fb_noconsole=1` | Do not draw the kernel console over iOS |
 | `a5touchprobe=0` | Disable the Galaxy A5 touch probe (it aborts on the S8) |

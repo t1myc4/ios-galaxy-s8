@@ -26,6 +26,7 @@
 static vm_offset_t s8ts_i2c, s8ts_alive, s8bat_i2c;
 static int s8ts_sleep;
 static int s8ts_native;         /* sweetfb_native: iOS sees the whole panel */
+static int s8ts_scale;          /* sweetfb_scale: canvas stretched over the panel */
 static bool s8ts_down[S8TS_FINGERS];
 static uint16_t s8ts_x[S8TS_FINGERS], s8ts_y[S8TS_FINGERS];
 
@@ -131,7 +132,8 @@ s8ts_report(const uint8_t *ev)
 	}
 	unsigned x = ((unsigned)ev[1] << 4) | (ev[3] >> 4);
 	unsigned y = ((unsigned)ev[2] << 4) | (ev[3] & 0xf);
-	if (s8ts_native) {
+	if (s8ts_native || s8ts_scale) {
+		/* The canvas covers the whole panel. */
 		x = x * 1080 / 4096;
 		y = y * 1920 / 4096;
 	} else {
@@ -269,6 +271,7 @@ dreamlte_touch_start(void)
 	int enabled = 1;
 	(void)PE_parse_boot_argn("s8touch", &enabled, sizeof(enabled));
 	(void)PE_parse_boot_argn("sweetfb_native", &s8ts_native, sizeof(s8ts_native));
+	(void)PE_parse_boot_argn("sweetfb_scale", &s8ts_scale, sizeof(s8ts_scale));
 	if (!enabled) {
 		printf("S8 TOUCH: disabled\n");
 		return;
@@ -289,11 +292,28 @@ dreamlte_touch_start(void)
 	}
 	uint8_t func[3] = {0x30, 0x01, 0x00};                  /* TOUCH_FUNCTION = touch */
 	uint8_t sense = 0x10;                                   /* SENSE_ON */
-	if (!s8i2c_xfer(s8ts_i2c, S8TS_ADDR, func, 3, NULL, 0) ||
-	    !s8i2c_xfer(s8ts_i2c, S8TS_ADDR, &sense, 1, NULL, 0)) {
-		printf("S8 TOUCH: enable sequence failed\n");
+	/*
+	 * Right after its rails come up the controller answers reads but may not
+	 * take writes yet (Linux waits 140 ms for INFO_BOOT_COMPLETE first), and
+	 * on boot 40 a failed write left the bus stuck: retry after a bus reset.
+	 */
+	int tries = 0;
+	bool f = false, s = false;
+	for (; tries < 20; tries++) {
+		f = s8i2c_xfer(s8ts_i2c, S8TS_ADDR, func, 3, NULL, 0);
+		s = f && s8i2c_xfer(s8ts_i2c, S8TS_ADDR, &sense, 1, NULL, 0);
+		if (s) {
+			break;
+		}
+		s8i2c_reset(s8ts_i2c);
+		delay(50000);
+	}
+	if (!s) {
+		printf("S8 TOUCH: enable sequence failed (%s), int %#x trans %#x\n",
+		    f ? "SENSE_ON" : "TOUCH_FUNCTION", a5touch_read(s8ts_i2c, 0x24), a5touch_read(s8ts_i2c, 0x50));
 		return;
 	}
+	printf("S8 TOUCH: enabled after %d retries\n", tries);
 	if (kernel_thread_start(s8ts_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	} else {

@@ -506,7 +506,9 @@ edit('iokit/Kernel/arm/SweetFramebuffer.cpp', [
      '\t}\n', 1),
     ('\tuint32_t mask = get32(rec, 0x104);\n',
      '\tuint32_t mask = get32(rec, 0x104);\n\tIOLockLock(fPresentLock);\n'
-     '#if defined(DREAMLTE)\n\tsweet_fb_wait_frame_done();\n#endif\n', 1),
+     '#if defined(DREAMLTE)\n\tuint64_t t0 = mach_absolute_time();\n'
+     '\tsweet_fb_wait_frame_done();\n\tsweet_fb_trigger(false);\n'
+     '\tuint64_t t1 = mach_absolute_time();\n#endif\n', 1),
     ('static uint32_t sweet_fb_swaps_logged;\n',
      '#if defined(DREAMLTE)\n'
      '/*\n'
@@ -536,11 +538,306 @@ edit('iokit/Kernel/arm/SweetFramebuffer.cpp', [
      '\t\tIODelay(100);\n'
      '\t}\n'
      '}\n'
+     '\n'
+     '/*\n'
+     ' * Boot 32: frames still tore. The S8 panel runs in command mode: on\n'
+     ' * every TE the DECON sends the whole buffer to the panel\'s own frame\n'
+     ' * memory, also while we copy into it. Samsung\'s DECON driver masks the\n'
+     ' * hardware trigger around an update (decon_reg_set_trigger:\n'
+     ' * HW_SW_TRIG_CONTROL 0x70, HW_TRIG_EN bit 0, HW_TRIG_MASK_DECON bit 4).\n'
+     ' * Mask it right after a frame-done (no transfer in flight), copy, unmask:\n'
+     ' * the panel keeps showing the previous frame and then gets a whole one.\n'
+     ' */\n'
+     'static void\n'
+     'sweet_fb_trigger(bool enable)\n'
+     '{\n'
+     '\tif (sweet_fb_decon == 0) {\n'
+     '\t\treturn;\n'
+     '\t}\n'
+     '\tvolatile uint32_t *trig = (volatile uint32_t *)(sweet_fb_decon + 0x70);\n'
+     '\tuint32_t v = *trig & ~((1u << 0) | (1u << 4));\n'
+     '\t*trig = v | (enable ? (1u << 0) : (1u << 4));\n'
+     '}\n'
      '#endif\n'
      '\n'
      'static uint32_t sweet_fb_swaps_logged;\n', 1),
     ('\t\ts->release();\n\t}\n}\n',
-     '\t\ts->release();\n\t}\n\tIOLockUnlock(fPresentLock);\n}\n', 1),
+     '\t\ts->release();\n\t}\n'
+     '#if defined(DREAMLTE)\n\tsweet_fb_trigger(true);\n'
+     '\tsweet_fb_stat(t0, t1, mach_absolute_time());\n#endif\n'
+     '\tIOLockUnlock(fPresentLock);\n}\n', 1),
+    # Frame statistics: how many frames iOS draws (SwapEnd) and the panel
+    # shows (copies) per 10 s, and where a copy's time goes (waiting for
+    # the DECON frame-done vs the memcpy), to steer the 30-60 fps work.
+    ('static uint32_t sweet_fb_swaps_logged;\n',
+     '#if defined(DREAMLTE)\n'
+     'static uint64_t sweet_fb_stat_start, sweet_fb_stat_swaps, sweet_fb_stat_copies;\n'
+     'static uint64_t sweet_fb_stat_wait, sweet_fb_stat_copy, sweet_fb_stat_copy_max;\n'
+     '\n'
+     '/* Under fPresentLock; timebase 26 MHz, 26 ticks = 1 us. */\n'
+     'static void\n'
+     'sweet_fb_stat(uint64_t t0, uint64_t t1, uint64_t t2)\n'
+     '{\n'
+     '\tsweet_fb_stat_copies++;\n'
+     '\tsweet_fb_stat_wait += t1 - t0;\n'
+     '\tsweet_fb_stat_copy += t2 - t1;\n'
+     '\tif (t2 - t1 > sweet_fb_stat_copy_max) {\n'
+     '\t\tsweet_fb_stat_copy_max = t2 - t1;\n'
+     '\t}\n'
+     '\tif (sweet_fb_stat_start == 0) {\n'
+     '\t\tsweet_fb_stat_start = t2;\n'
+     '\t} else if (t2 - sweet_fb_stat_start >= 10ULL * 26000000ULL) {\n'
+     '\t\tuint64_t n = sweet_fb_stat_copies;\n'
+     '\t\tIOLog("SWEET FB: 10s: %llu swaps, %llu shown; per frame wait %llu us, copy %llu us (max %llu)\\n",\n'
+     '\t\t    __atomic_load_n(&sweet_fb_stat_swaps, __ATOMIC_RELAXED), n,\n'
+     '\t\t    sweet_fb_stat_wait / n / 26, sweet_fb_stat_copy / n / 26, sweet_fb_stat_copy_max / 26);\n'
+     '\t\tsweet_fb_stat_start = t2;\n'
+     '\t\t__atomic_store_n(&sweet_fb_stat_swaps, 0, __ATOMIC_RELAXED);\n'
+     '\t\tsweet_fb_stat_copies = sweet_fb_stat_wait = sweet_fb_stat_copy = sweet_fb_stat_copy_max = 0;\n'
+     '\t}\n'
+     '}\n'
+     '#endif\n'
+     '\n'
+     'static uint32_t sweet_fb_swaps_logged;\n', 1),
+    ('\tif ((++sweet_fb_swap_count % 1000) == 0) {\n',
+     '#if defined(DREAMLTE)\n'
+     '\t__atomic_add_fetch(&sweet_fb_stat_swaps, 1, __ATOMIC_RELAXED);\n'
+     '#endif\n'
+     '\tif ((++sweet_fb_swap_count % 1000) == 0) {\n', 1),
+])
+
+# Boot 35: TWRP did not keep the pmsg zone, so the loader's probe results
+# (display flip CRC, Mongoose rail/cluster, Mali ID) were lost although the
+# kernel's own log on USERDATA was fine. Copy the loader's text from its
+# DISPLAY probe up to JUMP TO XNU into the kernel log once, at AppleCLCD
+# start (IOLog reaches the USERDATA ring by then).
+edit('iokit/Kernel/arm/SweetFramebuffer.cpp', [
+    ('bool\nAppleCLCD::start(IOService *provider)\n{\n',
+     '#if defined(DREAMLTE)\n'
+     'extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);\n'
+     '\n'
+     '/* The kernel has no strstr. */\n'
+     'static bool\n'
+     'sweet_fb_has(const char *s, const char *w)\n'
+     '{\n'
+     '\tsize_t n = strlen(w);\n'
+     '\tfor (; *s; s++) {\n'
+     '\t\tif (strncmp(s, w, n) == 0) {\n'
+     '\t\t\treturn true;\n'
+     '\t\t}\n'
+     '\t}\n'
+     '\treturn false;\n'
+     '}\n'
+     '\n'
+     'static void\n'
+     'sweet_fb_echo_loader(void)\n'
+     '{\n'
+     '\tconst volatile uint32_t *hdr = (const volatile uint32_t *)ml_io_map(A5_KLOG_PHYS, A5_KLOG_SIZE);\n'
+     '\tif (hdr == NULL || hdr[0] != 0x43474244u) {\n'
+     '\t\treturn;\n'
+     '\t}\n'
+     '\tconst volatile char *t = (const volatile char *)(hdr + 3);\n'
+     '\tuint32_t n = A5_KLOG_SIZE - 12, i = 0, start = UINT32_MAX;\n'
+     '\tchar line[160];\n'
+     '\tfor (uint32_t lines = 0; i < n && lines < 120; ) {\n'
+     '\t\tuint32_t len = 0;\n'
+     '\t\twhile (i < n && t[i] != \'\\n\' && t[i] != 0) {\n'
+     '\t\t\tif (len < sizeof(line) - 1) {\n'
+     '\t\t\t\tchar c = t[i];\n'
+     '\t\t\t\tline[len++] = (c >= 0x20 && c < 0x7f) ? c : \'?\';\n'
+     '\t\t\t}\n'
+     '\t\t\ti++;\n'
+     '\t\t}\n'
+     '\t\tline[len] = 0;\n'
+     '\t\tif (i < n && t[i] == 0) {\n'
+     '\t\t\tbreak;\n'
+     '\t\t}\n'
+     '\t\ti++;\n'
+     '\t\t/* pmsg cells lose bits: accept any of the probes\' first lines. */\n'
+     '\t\tif (start == UINT32_MAX && (sweet_fb_has(line, "DISPLAY") || sweet_fb_has(line, "rail") ||\n'
+     '\t\t    sweet_fb_has(line, "GPU") || sweet_fb_has(line, "MNGS"))) {\n'
+     '\t\t\tstart = i;\n'
+     '\t\t}\n'
+     '\t\tif (start != UINT32_MAX) {\n'
+     '\t\t\tIOLog("S8 LOADER| %s\\n", line);\n'
+     '\t\t\tlines++;\n'
+     '\t\t\tif (strncmp(line, "JUMP TO XNU", 11) == 0) {\n'
+     '\t\t\t\tbreak;\n'
+     '\t\t\t}\n'
+     '\t\t}\n'
+     '\t}\n'
+     '}\n'
+     '#endif\n'
+     '\n'
+     'bool\nAppleCLCD::start(IOService *provider)\n{\n'
+     '#if defined(DREAMLTE)\n'
+     '\tsweet_fb_echo_loader();\n'
+     '#endif\n', 1),
+])
+
+# Frame rate (boot 34 statistics: iOS draws 1-10 frames/s, CoreAnimation's
+# CPU renderer is the limit, the copy takes ~8 ms). sweetfb_scale=1: iOS
+# renders the iPhone X canvas (1125x2436, 36 % fewer pixels than the panel,
+# a layout iOS has data for) and each copy stretches it over the whole
+# 1440x2960 panel (nearest pixel, no borders). A panel row is built once in
+# a cached row buffer and copied to every panel row that maps to the same
+# canvas row.
+edit('iokit/Kernel/arm/SweetFramebuffer.cpp', [
+    ('#define SWEET_FB_FORMAT_BGRA            0x42475241\n',
+     '#define SWEET_FB_FORMAT_BGRA            0x42475241\n'
+     '#define SWEET_FB_ROW_MAX                1440u   /* widest panel row we stretch to */\n', 1),
+    ('\tuint64_t      fMinGap;        /* 1/hz in timebase ticks */\n',
+     '\tuint64_t      fMinGap;        /* 1/hz in timebase ticks */\n'
+     '\tbool          fScale;         /* sweetfb_scale: canvas stretched to the panel */\n', 1),
+    ('\tfOffY = (int32_t)(fLogicalH - fHeight) / 2;\n',
+     '\tfOffY = (int32_t)(fLogicalH - fHeight) / 2;\n'
+     '#if defined(DREAMLTE)\n'
+     '\tint scale = 0;\n'
+     '\tPE_parse_boot_argn("sweetfb_scale", &scale, sizeof(scale));\n'
+     '\tfScale = scale != 0 && !native && fWidth <= SWEET_FB_ROW_MAX;\n'
+     '\tif (fScale) {\n'
+     '\t\tfOffX = fOffY = 0;\n'
+     '\t}\n'
+     '#endif\n', 1),
+    ('\t\tuint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;\n',
+     '\t\tuint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;\n'
+     '#if defined(DREAMLTE)\n'
+     '\t\tif (fScale) {\n'
+     '\t\t\tif (w <= 0 || h <= 0) {\n'
+     '\t\t\t\tw = (int32_t)s->width;\n'
+     '\t\t\t\th = (int32_t)s->height;\n'
+     '\t\t\t}\n'
+     '\t\t\tif (sx < 0 || sy < 0) {\n'
+     '\t\t\t\tsx = sy = 0;\n'
+     '\t\t\t}\n'
+     '\t\t\tif (dx < 0 || dy < 0) {\n'
+     '\t\t\t\tdx = dy = 0;\n'
+     '\t\t\t}\n'
+     '\t\t\tif (w > (int32_t)s->width - sx) {\n'
+     '\t\t\t\tw = (int32_t)s->width - sx;\n'
+     '\t\t\t}\n'
+     '\t\t\tif (h > (int32_t)s->height - sy) {\n'
+     '\t\t\t\th = (int32_t)s->height - sy;\n'
+     '\t\t\t}\n'
+     '\t\t\tif (w > (int32_t)fLogicalW - dx) {\n'
+     '\t\t\t\tw = (int32_t)fLogicalW - dx;\n'
+     '\t\t\t}\n'
+     '\t\t\tif (h > (int32_t)fLogicalH - dy) {\n'
+     '\t\t\t\th = (int32_t)fLogicalH - dy;\n'
+     '\t\t\t}\n'
+     '\t\t\tuint64_t end = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +\n'
+     '\t\t\t    (uint64_t)(sx + w) * 4;\n'
+     '\t\t\tif (src != 0 && bpe == 4 && w > 0 && h > 0 && s->elementWidth == 1 &&\n'
+     '\t\t\t    s->elementHeight == 1 && s->memory != NULL && end <= s->memory->getLength()) {\n'
+     '\t\t\t\tsweet_fb_scaled_copy(fPixels, fRowBytes, fWidth, fHeight, fLogicalW, fLogicalH,\n'
+     '\t\t\t\t    src + s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4,\n'
+     '\t\t\t\t    s->bytesPerRow, dx, dy, w, h);\n'
+     '\t\t\t}\n'
+     '\t\t\ts->release();\n'
+     '\t\t\tcontinue;\n'
+     '\t\t}\n'
+     '#endif\n', 1),
+    ('static uint32_t sweet_fb_swaps_logged;\n',
+     '#if defined(DREAMLTE)\n'
+     'static uint32_t sweet_fb_row[SWEET_FB_ROW_MAX];   /* under fPresentLock */\n'
+     'static uint16_t sweet_fb_xmap[SWEET_FB_ROW_MAX];\n'
+     '\n'
+     '/*\n'
+     ' * Stretch the canvas rectangle (dx, dy, w, h) of a layer, whose first\n'
+     ' * pixel is at src with stride bpr, over the panel: panel pixel (px, py)\n'
+     ' * shows canvas pixel (px * lw / pw, py * lh / ph).\n'
+     ' */\n'
+     'static void\n'
+     'sweet_fb_scaled_copy(uintptr_t fb, uint32_t fbBpr, uint32_t pw, uint32_t ph,\n'
+     '    uint32_t lw, uint32_t lh, uintptr_t src, uint32_t bpr,\n'
+     '    int32_t dx, int32_t dy, int32_t w, int32_t h)\n'
+     '{\n'
+     '\tuint32_t px0 = (uint32_t)dx * pw / lw, px1 = (uint32_t)(dx + w) * pw / lw;\n'
+     '\tuint32_t py0 = (uint32_t)dy * ph / lh, py1 = (uint32_t)(dy + h) * ph / lh;\n'
+     '\tif (px1 > pw) {\n'
+     '\t\tpx1 = pw;\n'
+     '\t}\n'
+     '\tif (py1 > ph) {\n'
+     '\t\tpy1 = ph;\n'
+     '\t}\n'
+     '\tif (px1 <= px0 || py1 <= py0) {\n'
+     '\t\treturn;\n'
+     '\t}\n'
+     '\tuint32_t n = px1 - px0;\n'
+     '\tfor (uint32_t i = 0; i < n; i++) {\n'
+     '\t\tuint32_t lx = (px0 + i) * lw / pw;\n'
+     '\t\tint32_t cx = (int32_t)lx - dx;\n'
+     '\t\tsweet_fb_xmap[i] = (uint16_t)(cx < 0 ? 0 : (cx >= w ? w - 1 : cx));\n'
+     '\t}\n'
+     '\tint32_t built = -1;\n'
+     '\tfor (uint32_t py = py0; py < py1; py++) {\n'
+     '\t\tint32_t cy = (int32_t)(py * lh / ph) - dy;\n'
+     '\t\tcy = cy < 0 ? 0 : (cy >= h ? h - 1 : cy);\n'
+     '\t\tif (cy != built) {\n'
+     '\t\t\tconst uint32_t *row = (const uint32_t *)(src + (uint64_t)cy * bpr);\n'
+     '\t\t\tfor (uint32_t i = 0; i < n; i++) {\n'
+     '\t\t\t\tsweet_fb_row[i] = row[sweet_fb_xmap[i]];\n'
+     '\t\t\t}\n'
+     '\t\t\tbuilt = cy;\n'
+     '\t\t}\n'
+     '\t\tmemcpy((void *)(fb + (uint64_t)py * fbBpr + (uint64_t)px0 * 4), sweet_fb_row, (size_t)n * 4);\n'
+     '\t}\n'
+     '}\n'
+     '#endif\n'
+     '\n'
+     'static uint32_t sweet_fb_swaps_logged;\n', 1),
+])
+
+# GPU present (sweetfb_gpu=1): the Mali-G71 stretches each full-screen iOS
+# frame over the panel (tools/dreamlte/s8_gpu_present.inc, descriptor blob
+# from tools/dreamlte/mali-blit-gen.c). The GPU maps each frame surface's
+# pages through its own page tables (boot 41: contiguous allocation failed).
+edit('iokit/Kernel/arm/SweetFramebuffer.cpp', [
+    ('static uint32_t sweet_fb_swaps_logged;\n',
+     '#if defined(DREAMLTE)\n' +
+     (Path(__file__).parent / 's8_mali_blit.h').read_text() + '\n' +
+     (Path(__file__).parent / 's8mali_ioctl.h').read_text() + '\n' +
+     (Path(__file__).parent / 's8_gpu_present.inc').read_text() +
+     '/* Layouts the GPU present reads as BGRA8: BGRA, and \'b3a8\', the\n'
+     ' * extended-range surface CoreAnimation renders the display into with\n'
+     ' * the Metal plugin, which stores it as BGRA8 (boot 51). */\n'
+     'static inline bool\ns8gpu_bgra_layout(uint32_t f)\n{\n'
+     '\treturn f == SWEET_FB_FORMAT_BGRA || f == 0x62336138;\n}\n'
+     '#endif\n\nstatic uint32_t sweet_fb_swaps_logged;\n', 1),
+    ('bool\nAppleCLCD::start(IOService *provider)\n{\n#if defined(DREAMLTE)\n\tsweet_fb_echo_loader();\n#endif\n',
+     'static void s8gpu_init(void);\nstatic void s8gpu_publish_metal(IOService *provider);\n\n'
+     'bool\nAppleCLCD::start(IOService *provider)\n{\n#if defined(DREAMLTE)\n\tsweet_fb_echo_loader();\n#endif\n', 1),
+    ('\tsetProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");\n',
+     '#if defined(DREAMLTE)\n\ts8gpu_init();\n\ts8gpu_publish_metal(this);\n#endif\n'
+     '\tsetProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");\n', 1),
+    ('\t\t\t\tsweet_fb_scaled_copy(fPixels, fRowBytes, fWidth, fHeight, fLogicalW, fLogicalH,\n',
+     '\t\t\t\tif (s8gpu_ready && sx == 0 && sy == 0 && dx == 0 && dy == 0 &&\n'
+     '\t\t\t\t    w == (int32_t)fLogicalW && h == (int32_t)fLogicalH &&\n'
+     '\t\t\t\t    s8gpu_bgra_layout(s->pixelFormat) &&\n'
+     '\t\t\t\t    s8gpu_present(s->memory, s->id, s->offset, src + s->offset, s->bytesPerRow,\n'
+     '\t\t\t\t    (uint32_t)w, (uint32_t)h)) {\n'
+     '\t\t\t\t\ts->release();\n'
+     '\t\t\t\t\tcontinue;\n'
+     '\t\t\t\t}\n'
+     '\t\t\t\tsweet_fb_scaled_copy(fPixels, fRowBytes, fWidth, fHeight, fLogicalW, fLogicalH,\n', 1),
+    # Boot 39: with the 1125x2436 canvas SpringBoard aborted in a loop
+    # (BoundingPathBitmap-1125x2436-375x812-3.00x not in the asset manager),
+    # so the GPU also presents the native 1440x2960 canvas, 1:1.
+    ('\t\tif (src != 0 && bpe == 4) {\n\t\t\tfor (int32_t y = 0; y < h; y++) {\n',
+     '#if defined(DREAMLTE)\n'
+     '\t\tif (src != 0 && bpe == 4 && s8gpu_ready && sx == 0 && sy == 0 && dx == 0 && dy == 0 &&\n'
+     '\t\t    w == (int32_t)fWidth && h == (int32_t)fHeight && s8gpu_bgra_layout(s->pixelFormat)) {\n'
+     '\t\t\tif (s8gpu_present(s->memory, s->id, s->offset, src + s->offset, s->bytesPerRow,\n'
+     '\t\t\t    (uint32_t)w, (uint32_t)h)) {\n'
+     '\t\t\t\ts->release();\n'
+     '\t\t\t\tcontinue;\n'
+     '\t\t\t}\n'
+     '\t\t} else if (s8gpu_ready && s8gpu_skips++ < 8) {\n'
+     '\t\t\tIOLog("S8 GPU: layer not GPU-presentable: src %d bpe %u s %d,%d d %d,%d %dx%d fmt 0x%x\\n",\n'
+     '\t\t\t    src != 0, bpe, sx, sy, dx, dy, w, h, s->pixelFormat);\n'
+     '\t\t}\n'
+     '#endif\n'
+     '\t\tif (src != 0 && bpe == 4) {\n\t\t\tfor (int32_t y = 0; y < h; y++) {\n', 1),
 ])
 
 # Battery: the A5XELTE config had no power source, so iOS showed a wrong
@@ -611,8 +908,10 @@ edit('bsd/dev/a5xelte_touch.c', [
 # Secondary CPUs. Loader probe (boot 19): PSCI CPU_ON alone never starts an
 # S8 core; after the PMU power-up that Samsung's kernel does itself
 # (drivers/soc/samsung/exynos-pmu.c: CPUn_CONFIGURATION |= LOCAL_PWR_CFG 0xF)
-# the A53 at MPIDR 0x101 started. The Mongoose cluster also needs its
-# cluster power (L2/non-CPU), not done yet: use cpus<=4 (the A53 cluster).
+# the A53 at MPIDR 0x101 started. Mongoose cores (MPIDR 0-3, logical 4-7)
+# also need Samsung's cluster0_on and their DDn bit (pmucal_cpu_exynos8895.h),
+# as the loader's mngs_probe does; the loader caps cpus= at 4 + the number
+# of Mongoose cores its probe started, so cpus=8 does not panic here.
 edit('iokit/Kernel/arm/SweetCPU.cpp', [
     ('#include <pexpert/pexpert.h>\n',
      '#include <pexpert/pexpert.h>\n'
@@ -652,6 +951,39 @@ edit('iokit/Kernel/arm/SweetCPU.cpp', [
      '\t\t    (cpu->phys_id & 0xf)) * 0x80);\n'
      '\t\tvolatile uint32_t *cfg = (volatile uint32_t *)(pmu + off);\n'
      '\t\t/*\n'
+     '\t\t * Mongoose M2 (MPIDR Aff1 0): Samsung\'s cluster0_on once, and\n'
+     '\t\t * core0n_off/core0n_on clear/set DDn_DD_DA_INPUT_0 (0x16840000 +\n'
+     '\t\t * n * 0x400) around the power edge. The loader probe turned its\n'
+     '\t\t * cores off again (CPU_OFF), so the cluster steps are redone here.\n'
+     '\t\t */\n'
+     '\t\tconst bool mngs = ((cpu->phys_id >> 8) & 0xf) == 0;\n'
+     '\t\tstatic vm_offset_t dd;\n'
+     '\t\tstatic bool mngs_cluster_on;\n'
+     '\t\tvolatile uint32_t *ddn = NULL;\n'
+     '\t\tif (mngs) {\n'
+     '\t\t\tvolatile uint32_t *p = (volatile uint32_t *)pmu;\n'
+     '\t\t\tif (dd == 0) {\n'
+     '\t\t\t\tdd = ml_io_map(0x16840000, 0x2000);\n'
+     '\t\t\t}\n'
+     '\t\t\tddn = (volatile uint32_t *)(dd + (cpu->phys_id & 3) * 0x400);\n'
+     '\t\t\tif (!mngs_cluster_on) {\n'
+     '\t\t\t\tp[0x3c20 / 4] |= 1;            /* CPU_QCH_EMBEDDED_CMU_CPUCL0 */\n'
+     '\t\t\t\tfor (int i = 0; i < 50000 && !(p[0x3c24 / 4] & 1); i++) {\n'
+     '\t\t\t\t\tIODelay(1);\n'
+     '\t\t\t\t}\n'
+     '\t\t\t\tp[0x45c0 / 4] |= 1;            /* CLKSTOP_CMU_EMBEDDED_CMU_CPUCL0 */\n'
+     '\t\t\t\tfor (int i = 0; i < 50000 && !(p[0x45c4 / 4] & 1); i++) {\n'
+     '\t\t\t\t\tIODelay(1);\n'
+     '\t\t\t\t}\n'
+     '\t\t\t\t*(volatile uint32_t *)(dd + 0x1000) |= 1;     /* DD4 */\n'
+     '\t\t\t\tp[0x2488 / 4] &= ~1u;          /* CLUSTER0_CPUSEQUENCER_OPTION */\n'
+     '\t\t\t\tmngs_cluster_on = true;\n'
+     '\t\t\t\tIOLog(CPU_PORT_NAME " CPU: Mongoose cluster on: qch=0x%x clkstop=0x%x seq=0x%x\\n",\n'
+     '\t\t\t\t    p[0x3c24 / 4], p[0x45c4 / 4], p[0x2484 / 4]);\n'
+     '\t\t\t}\n'
+     '\t\t\t*ddn &= ~1u;\n'
+     '\t\t}\n'
+     '\t\t/*\n'
      '\t\t * The sequence that started a core in the loader probe: PSCI\n'
      '\t\t * CPU_ON, then a PMU power-up (LOCAL_PWR_CFG 0 -> 0xF), then CPU_ON\n'
      '\t\t * again (below). Boot 20 skipped the 0 -> 0xF edge (cfg was left\n'
@@ -667,11 +999,88 @@ edit('iokit/Kernel/arm/SweetCPU.cpp', [
      '\t\tfor (int i = 0; i < 10000 && (cfg[1] & 0xf) != 0xf; i++) {\n'
      '\t\t\tIODelay(1);\n'
      '\t\t}\n'
+     '\t\tif (ddn != NULL) {\n'
+     '\t\t\t*ddn |= 1;\n'
+     '\t\t\t/*\n'
+     '\t\t\t * Boot 33: the cluster\'s NONCPU (0x2404) and L2 (0x2604) status\n'
+     '\t\t\t * stayed off after the core power-up. Power them through their\n'
+     '\t\t\t * CONFIGURATION registers (0x2400 = 0xF, 0x2600 = 0x7), as the\n'
+     '\t\t\t * loader probe does. The loader also enables the BUCK2 rail.\n'
+     '\t\t\t */\n'
+     '\t\t\tvolatile uint32_t *pm = (volatile uint32_t *)pmu;\n'
+     '\t\t\tif ((pm[0x2404 / 4] & 0xf) != 0xf || (pm[0x2604 / 4] & 7) != 7) {\n'
+     '\t\t\t\tpm[0x2400 / 4] |= 0xf;\n'
+     '\t\t\t\tfor (int i = 0; i < 10000 && (pm[0x2404 / 4] & 0xf) != 0xf; i++) {\n'
+     '\t\t\t\t\tIODelay(1);\n'
+     '\t\t\t\t}\n'
+     '\t\t\t\tpm[0x2600 / 4] |= 7;\n'
+     '\t\t\t\tfor (int i = 0; i < 10000 && (pm[0x2604 / 4] & 7) != 7; i++) {\n'
+     '\t\t\t\t\tIODelay(1);\n'
+     '\t\t\t\t}\n'
+     '\t\t\t}\n'
+     '\t\t\tIOLog(CPU_PORT_NAME " CPU: cpu=%u Mongoose cluster noncpu=0x%x l2=0x%x\\n",\n'
+     '\t\t\t    getCPUNumber(), pm[0x2404 / 4], pm[0x2604 / 4]);\n'
+     '\t\t\t/*\n'
+     '\t\t\t * Boot 32: the Mongoose PLL (CMU_CPUCL0 PLL_CON0) was enabled\n'
+     '\t\t\t * at 1066 MHz but not STABLE (bit 29). Re-lock it as Samsung\'s\n'
+     '\t\t\t * cal-if ra.c does: mux (bit 4) to FIN, wait busy (bit 7),\n'
+     '\t\t\t * disable, LOCKTIME = P * 150, enable, wait STABLE, mux back.\n'
+     '\t\t\t */\n'
+     '\t\t\tstatic vm_offset_t cmu;\n'
+     '\t\t\tif (cmu == 0) {\n'
+     '\t\t\t\tcmu = ml_io_map(0x16800000, 0x1000);\n'
+     '\t\t\t}\n'
+     '\t\t\tvolatile uint32_t *con = (volatile uint32_t *)(cmu + 0x120);\n'
+     '\t\t\tfor (int i = 0; i < 10000 && !(*con & (1u << 29)); i++) {\n'
+     '\t\t\t\tIODelay(1);\n'
+     '\t\t\t}\n'
+     '\t\t\tif (!(*con & (1u << 29))) {\n'
+     '\t\t\t\tuint32_t v = *con;\n'
+     '\t\t\t\t*con = v & ~(1u << 4);\n'
+     '\t\t\t\tfor (int i = 0; i < 1000 && (*con & (1u << 7)); i++) {\n'
+     '\t\t\t\t\tIODelay(1);\n'
+     '\t\t\t\t}\n'
+     '\t\t\t\t*con &= ~(1u << 31);\n'
+     '\t\t\t\t*(volatile uint32_t *)cmu = ((v >> 8) & 0x3f) * 150;\n'
+     '\t\t\t\t*con |= 1u << 31;\n'
+     '\t\t\t\tfor (int i = 0; i < 10000 && !(*con & (1u << 29)); i++) {\n'
+     '\t\t\t\t\tIODelay(1);\n'
+     '\t\t\t\t}\n'
+     '\t\t\t\tif (*con & (1u << 29)) {\n'
+     '\t\t\t\t\t*con |= 1u << 4;\n'
+     '\t\t\t\t}\n'
+     '\t\t\t}\n'
+     '\t\t\tIOLog(CPU_PORT_NAME " CPU: cpu=%u Mongoose PLL con0=0x%x\\n", getCPUNumber(), *con);\n'
+     '\t\t}\n'
      '\t\tIOLog(CPU_PORT_NAME " CPU: cpu=%u first CPU_ON rc=%d, PMU power-up cfg=0x%x status=0x%x\\n",\n'
      '\t\t    getCPUNumber(), rc0, cfg[0], cfg[1]);\n'
      '\t}\n'
      '#endif\n'
      '\t__builtin_arm_dsb(DSB_SY);\n\tint32_t rc = sweet_psci_cpu_on(cpu->phys_id, entry, getCPUNumber());\n', 1),
+])
+
+# One scheduler cluster for all eight cores. A5XELTE derives the logical
+# cluster from MPIDR Aff1, so cpus>4 would create a second processor set;
+# the A5's eight-core trial panicked on CPU0 ("Ticket lock ... unexpectedly
+# owned") right after that, while cpus=4 (one set) runs. XNU schedules the
+# clusters symmetrically anyway (cluster-type SMP); the ADT keeps the real
+# die-cluster-id / l2-cache-id. Only MPIDR-indexed PPL data would need the
+# physical split, and this build has no XNU_MONITOR.
+edit('osfmk/arm64/machine_routines.c', [
+    ('#if HAS_CLUSTER || defined(A5XELTE)\n\t\tuint32_t phys_cluster_id = MPIDR_CLUSTER_ID(cpu->phys_id);\n',
+     '#if defined(DREAMLTE)\n'
+     '\t\tuint32_t phys_cluster_id = 0;\n'
+     '#elif HAS_CLUSTER || defined(A5XELTE)\n'
+     '\t\tuint32_t phys_cluster_id = MPIDR_CLUSTER_ID(cpu->phys_id);\n', 1),
+])
+
+# IOKit CPU names: the S8 has two core types.
+edit('iokit/Kernel/arm/SweetCPU.cpp', [
+    ('#if defined(A5XELTE)\n\tcpuName = OSSymbol::withCStringNoCopy("Cortex-A53");\n',
+     '#if defined(DREAMLTE)\n'
+     '\tcpuName = OSSymbol::withCStringNoCopy(((cpu->phys_id >> 8) & 0xf) == 0 ?\n'
+     '\t    "Mongoose M2" : "Cortex-A53");\n'
+     '#elif defined(A5XELTE)\n\tcpuName = OSSymbol::withCStringNoCopy("Cortex-A53");\n', 1),
 ])
 
 edit('bsd/dev/a5xelte_keys.c', [
@@ -715,3 +1124,40 @@ edit('bsd/dev/a5xelte_keys.c', [
     ('\tint enabled = 1;\n\tif (a5_keys_started) {',
      '\tint enabled = A5_KEYS_DEFAULT;\n\tif (a5_keys_started) {', 1),
 ])
+
+# /dev/s8mali and the boot overlay (tools/dreamlte/dreamlte_s8.c), run from
+# bsd_init right before launchd. s8_kernel_mkdir lets the overlay create
+# directories with the kernel's credentials.
+(tree / 'bsd/dev/dreamlte_s8.c').write_text((Path(__file__).parent / 'dreamlte_s8.c').read_text())
+print('wrote bsd/dev/dreamlte_s8.c')
+edit('bsd/conf/files', [
+    ('bsd/dev/a5xelte_keys.c\t\t\tstandard\n',
+     'bsd/dev/a5xelte_keys.c\t\t\tstandard\n'
+     'bsd/dev/dreamlte_s8.c\t\t\tstandard\n', 1),
+])
+edit('bsd/vfs/vfs_syscalls.c', [
+    ('int\nmkdir(proc_t p, struct mkdir_args *uap, __unused int32_t *retval)\n',
+     '/* Galaxy S8 boot overlay (bsd/dev/dreamlte_s8.c): mkdir as the kernel. */\n'
+     'int s8_kernel_mkdir(const char *path, int mode);\n'
+     'int\n'
+     's8_kernel_mkdir(const char *path, int mode)\n'
+     '{\n'
+     '\tstruct vnode_attr va;\n'
+     '\tVATTR_INIT(&va);\n'
+     '\tVATTR_SET(&va, va_mode, mode & ACCESSPERMS);\n'
+     '\treturn mkdir1at(vfs_context_kernel(), CAST_USER_ADDR_T(path), &va, AT_FDCWD, UIO_SYSSPACE);\n'
+     '}\n'
+     '\n'
+     'int\nmkdir(proc_t p, struct mkdir_args *uap, __unused int32_t *retval)\n', 1),
+])
+edit('bsd/kern/bsd_init.c', [
+    ('\tload_init_program(p);\n',
+     '#if defined(ARM64_BOARD_CONFIG_A5XELTE)\n'
+     '\t{\n'
+     '\t\textern void dreamlte_bsd_late(void);\n'
+     '\t\tdreamlte_bsd_late();\n'
+     '\t}\n'
+     '#endif\n'
+     '\tload_init_program(p);\n', 1),
+])
+

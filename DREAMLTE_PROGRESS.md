@@ -90,8 +90,643 @@ to the pmsg zone and read from TWRP as `/sys/fs/pstore/pmsg-ramoops-0`.
   SwapBegin never completed. **Boot 19 (`sweetfb_native=1`, 1440x2960): iOS
   lock screen on the Galaxy S8**, one CPU, CPU rendering, ~15 min to reach it.
 
-## Next
+## Boots 20-31 (2026-10-20/21, from the commit log)
 
-1. CI kernel build; first boot target: loader log + XNU entry marker, then the
-   early XNU console on the S8 screen.
-2. UFS driver for the root filesystem (USERDATA), then the iPhone X root.
+- Boots 20-22: the A53s start only with a PMU power edge around PSCI CPU_ON
+  (power down, CPU_ON, `CPUn_CONFIGURATION` 0 -> 0xF, CPU_ON again) and a
+  low CPU_ON entry (trampoline at `0x8f000000`: the firmware keeps the entry
+  in a 32-bit PMU INFORM register). Boot 22: 4/4 A53s up.
+- Boots 22-25: with 4 CPUs rendering stalled (timed wakeups failed off the
+  boot CPU). Fix: the physical EL1 timer (PPI 14, INTID 30), as Samsung's
+  DT says (`use-physical-timer`). Keys: GPA0/GPA2 ALIVE banks.
+- Boots 25-27: touch rails (S2MPS17 LDO34/35 over SPEEDY), S6SY761 driver;
+  77 taps/swipes reached SpringBoard. RTC date via `s8rtc=`.
+- Boots 28-29: MAX77865 fuel gauge (99 %, 4149 mV); DECON/IDMA probe: IDMA0
+  scans `0xcc000000`, moving its base changed nothing on screen yet.
+- Boot 30: full-screen 1440x2960 presentation kept (the user prefers it).
+- Boot 31 (video): lock screen, home screen, App Library, Control Center,
+  battery work; frames tear. MNGS probe: cluster and core 0x000 powered
+  (status 0xf), CPU_ON rc 0, the core never ran the entry.
+- `04b4172` (not yet booted): copy each frame right after a DECON frame-done;
+  probe core 0x000 in the A53 order.
+
+## Eight cores: Mongoose bring-up (2026-10-21, not yet booted)
+
+Reference: Samsung's universal8895 kernel (jcadduono/android_kernel_samsung_universal8895).
+There, `cal_cluster_enable`/`cal_cpu_enable` run on `CPU_STARTING`, i.e.
+after PSCI already started the core; on our S-Boot handoff PSCI alone never
+started any core, so we apply the PMU sequences of
+`cal-if/exynos8895/pmucal_cpu_exynos8895.h` ourselves:
+`cluster0_on` (CPU_QCH `0x3C20`/`0x3C24`, CLKSTOP `0x45C0`/`0x45C4`, DD4,
+CPUSEQUENCER_OPTION `0x2488` bit 0 := 0), `core0n_on` = CONFIGURATION 0xF +
+`DDn_DD_DA_INPUT_0` (`0x16840000 + n * 0x400`), `core0n_off` the reverse.
+
+- Loader `mngs_probe` starts Mongoose cores 0x000..0x003 one by one with the
+  A53 order and stops at the first that does not run `smp_entry`. It returns
+  the count; **the loader caps `cpus=N` to 4 + that count**, so a `cpus=8`
+  image still boots on the four A53s when the big cores stay off.
+  `s8mngsdbg=1` also logs the CPUCL0/CPUCL1 PLL_CON0 and PLL mux (the CL0
+  CMU is read only after the cluster is on).
+- XNU (`0124`): `SweetCPU::startCPU` runs `cluster0_on` once and the DDn
+  bit around each Mongoose core's power edge; the IOKit CPU name is
+  "Mongoose M2" for those. All eight cores form **one scheduler cluster**
+  (`phys_cluster_id = 0` on DREAMLTE): a second processor set is what the
+  A5's eight-core trial panicked on ("Ticket lock ... unexpectedly owned"),
+  while one set with 4 CPUs runs. The ADT keeps the real
+  `die-cluster-id`/`l2-cache-id`.
+- Test: boot args `cpus=8 s8mngsdbg=1`. Read in the loader log
+  `MONGOOSE STARTED=` and `cpus capped to` (if any), then in the kernel log
+  `Mongoose cluster on`, `cpu=4..7 came alive` and `8/8 CPUs initialized`.
+
+- **Boot 32** (CI run 39634152445, kernel SHA-256 `9bca4568…a230c4`,
+  BOOT `8bb46c4d…54d4c7`, `cpus=8 s8mngsdbg=1`): Mongoose core 0x000 again
+  did not run its entry (CPU_ON rc 0, status `0x10070f0f`), so the loader
+  logged `cpus capped to=0x4` and the system booted on the four A53s
+  (`4/4 CPUs initialized`, SpringBoard, display on): the cap works.
+  Probe readings (pmsg has bit flips): CPUSEQUENCER_STATUS `0x2484` =
+  `0x60000` before and after `cluster0_on` (bit 0, Samsung's
+  `cluster0_status`, stays 0); CPUCL1 PLL_CON0 `0xa0e?0311` with STABLE set
+  (970 MHz entry of the A53 table); **CPUCL0 PLL_CON0 `0x81ec0312`: enabled,
+  1066 MHz (492/3/2), output selected, STABLE clear.**
+- Next probe: logs NONCPU/L2 status after the core's power edge and
+  re-locks the Mongoose PLL as Samsung's `ra.c` does (mux to FIN, disable,
+  LOCKTIME = P * 150, enable, wait STABLE, mux back); XNU repeats it.
+- Boot 32 still tore (user report). The panel is in command mode: each TE
+  sends the whole buffer to the panel's own memory, also during our copy.
+  AppleCLCD now masks the DECON hardware trigger (`0x70`: HW_TRIG_EN bit 0
+  off, HW_TRIG_MASK_DECON bit 4 on, as Samsung's `decon_reg_set_trigger`)
+  right after a frame-done, copies, and unmasks it.
+- **Boot 33** (CI run 39638299592, BOOT `36a04df1…ac37f16`, PLL relock +
+  trigger masking, `sweetfb_hz` still 10): user reports no smoother motion
+  (expected at 10 Hz); tearing "almost gone" (user) with the trigger
+  masking. Probe after the core power edge: CPUSEQUENCER_STATUS
+  `0x60000`, **NONCPU status `0x5140000` and L2 status `0x10050000`: both
+  off**; PLL relock `0x81ec0302`, LOCKTIME `0x1c2`, not stable. The cluster
+  itself never powers, so neither its PLL nor a core can run. Again capped
+  to 4 CPUs; 4/4 A53s up, SpringBoard ran.
+- Next: the loader logs S2MPS17 BUCK2 (`vdd_cpucl0`, regs `0x1b/0x1c`)
+  next to BUCK3 and enables BUCK2 (>= 0.8 V) if it is off: Samsung's DT
+  marks it always-on, so Linux enables it itself. If NONCPU/L2 are still off
+  after the core power edge, loader and XNU set their CONFIGURATION
+  registers (`0x2400` = 0xF, `0x2600` = 0x7; names from the 8890 pmusfr).
+  Frame statistics every 10 s and `sweetfb_hz=30` for the 30-60 fps work.
+
+- **Boot 34** (CI run 39641507601, first BOOT `bf45ab21…146d1d`, without
+  the CRC probe): BUCK2 was already on (`b2ctrl=0x70`, the same enable mode
+  01 as the A53 rail `b3ctrl=0x58`); forcing NONCPU/L2 CONFIGURATION did not
+  change their status (`0x5140000` / `0x10050000`), the PLL stayed unlocked,
+  core 0x000 did not run; capped to 4 CPUs. **Frame statistics** (10 s
+  windows): iOS swapped 1-10 frames/s, all of them shown; copy ~8.3 ms,
+  frame-done wait ~9 ms per frame. The limit is CoreAnimation's CPU
+  rendering (100-500 ms per frame), not the presentation.
+
+## Hardware graphics through the DPU (plan, 2026-10-21)
+
+The Mali-G71 cannot serve iOS (Metal/AGX). The display processor can do
+the work the CPU does now: scan out a frame without the copy, blend up to
+six layers (DPP channels, IOMobileFramebuffer layers) and scale in hardware.
+1. Prove a flip: the loader's display probe now compares the DECON output
+   CRC (`CRC_CONTROL 0x288`, `CRC_DATA 0x280`) before and after moving the
+   IDMA base; `FLIP WORKS=1` means the DECON fetches from the new address.
+2. IDMA addresses are 32-bit (`IDMA_IN_BASE_ADDR_Y 0x40`, no high word) and
+   XNU's RAM is at `0x880000000`: iOS surfaces are out of reach unless the
+   DPU SYSMMU maps them or full-screen surfaces come from a pool below
+   4 GiB. Needs the free low RAM from TWRP's `/proc/iomem`.
+3. Zero-copy present: SwapEnd points the IDMA at the surface (trigger
+   masked, shadow update, unmask) instead of copying 17 MB.
+4. Hardware layers and scaling: map up to four swap layers to DPP channels;
+   a smaller iOS canvas scaled up by the DPP.
+5. Panel scaler: the S6E3HA6 DDI scales 1080x2220 or 720x1480 input to the
+   full panel (Samsung `s6e3ha6_dream_a3_da_panel.h` scaler/CASET/PASET/PPS
+   tables, the Android "screen resolution" setting): fewer pixels for iOS to
+   draw.
+
+- **Boot 35** (BOOT `ef8e775f…d6a871`, `s8gpu=1`): iOS booted as before
+  (capped to 4 CPUs, frame statistics similar), so the GPU probe did not hang
+  the loader, but TWRP kept no `pmsg-ramoops-0` this time and the probe
+  results were lost. XNU now copies the loader's probe lines (from the first
+  DISPLAY/rail/GPU/MNGS line to JUMP TO XNU) into its USERDATA log as
+  `S8 LOADER| ...` at AppleCLCD start.
+
+## Mali-G71 for iOS (started 2026-10-21)
+
+- **Boot 36** (CI run 39647955854, BOOT `45bc176e…1fe8c3`): the loader
+  lines reached the kernel log. **Mali answers: `GPU_ID=0x60a00001`**
+  (product `0x60a0` = kbase TMIx, Mali-G71 r0p0; the probe's `0x6000`
+  check was wrong), `SHADER_PRESENT=0x17771777` (20 cores),
+  `L2_FEATURES=0x7130206`, `L2_PRESENT=1`; pd-g3d was already on
+  (`0x3000f`), BUCK6 on (`0xb8`), CMU_G3D `0x140=0xa0a00412` (PLL on and
+  stable). Flip test: CRC `0xd279` before and after moving the IDMA base,
+  `FLIP WORKS=0`. Mongoose unchanged (cluster NONCPU/L2 off).
+- Step 2 (loader, `s8gpu=1`): soft reset, power L2/tiler/20 shaders, AS0 in
+  IDENTITY mode, a NULL job and a WRITE_VALUE job on slot 0 that must store
+  `0x5a5a1234`; logs `GPU JOB WORKS`.
+
+- **Boot 37** (BOOT `11ed9b64…ff9686`): **the GPU runs jobs.** Soft reset,
+  L2/tiler/all 20 shader cores ready (`0x17771777`), AS0 IDENTITY update
+  done; NULL job and WRITE_VALUE job both completed (JOB_IRQ 1, JS status 0,
+  exception status 1 = done), the GPU stored `0x5a5a1234`, no AS0 fault:
+  `GPU JOB WORKS=1`.
+- Step 3 (loader): a fragment job clears a 256x256 square of the scanned-out
+  S-Boot framebuffer (x 592, y 2496) to grey through the GPU's tile
+  writeback; descriptors per Mesa 25.2.8 `genxml/v6.xml` and Panfrost's
+  clear-only `pan_emit_fbd`/`pan_emit_rt`; logs `GPU DRAW WORKS`.
+
+- **Boot 38** (BOOT `71701cb4…cb21d7`): **the GPU draws.** The fragment
+  job completed without fault and all 256 sampled pixels of the 256x256
+  square read `0xffc0c0c0`: `GPU DRAW WORKS=1`.
+- Frame rate, `sweetfb_scale=1`: iOS renders the iPhone X canvas
+  (1125x2436, 36 % fewer pixels) and each copy stretches it over the whole
+  panel (nearest pixel, cached row buffer reused for repeated rows); touches
+  use the full-panel mapping.
+- GPU for iOS, plan: XNU Mali driver (power, reset, address space, job
+  slot), a Bifrost blit shader built with Mesa's compiler, then iOS frames
+  composed and stretched by the GPU instead of the CPU copy.
+
+- **Boot 39** (BOOT `b85fc046…c721f751`, `sweetfb_scale=1`): Apple logo,
+  then black. The log shows the 1125x2436 swaps arriving (bpr 4608) and
+  touches/keys working, but SpringBoard aborting in a loop (12 execs):
+  `NSInternalInconsistencyException: Failed to load bounding path bitmap
+  data from the asset manager for asset name:
+  BoundingPathBitmap-1125x2436-375x812-3.00x`. The iPhone X canvas needs
+  that asset; likely the MobileGestalt cache built during the 1440x2960
+  boots no longer matches. Back to the native canvas until that is fixed;
+  the GPU present path now also handles the native canvas 1:1.
+- **Boot 40** (BOOT `0f0e52e8…c30db2efc`, `sweetfb_gpu=1`, native canvas):
+  `S8 GPU: Mali-G71 0x60a00001 reset=1 l2=1 tiler=1 shaders=0x17771777/1
+  as0=1 -> GPU present on`, but every frame still went through the CPU copy
+  (no GPU frame or error lines): the GPU path was never taken. Touch: the
+  S6SY761 ID read worked, then one enable write failed (`enable sequence
+  failed`), so no touch this boot. Next: the enable writes retry after a
+  bus reset; the log says why a layer is not GPU-presented and whether the
+  contiguous surface allocation worked.
+- **Boot 41** (BOOT `8067accb…d3c2a041`): touch works again (enable
+  retries). `SWEET SURF: contiguous 17428480 bytes: failed`, so every frame
+  was `not contiguous: segment 4096 need 17428352` and went through the CPU.
+  Next: the Mali gets its own page tables (kbase AArch64 4K format, AS mode
+  6); the blob and panel are mapped VA = PA, and each frame surface's
+  scattered pages are mapped into a 32 MiB GPU window (4 slots at
+  `0x100000000`, rebuilt only when a slot is reused, then AS lock +
+  FLUSH_MEM). The contiguous allocation is gone.
+- **GPU present (built, not yet booted):** `tools/dreamlte/mali-blit-gen.c`,
+  built against Mesa 25.2.8 (`build-mali-blit.sh`), compiles a Bifrost
+  fragment shader for GPU_ID `0x60a00001` (144 bytes: `VAR_TEX.f32` +
+  `BLEND`, checked with Mesa's disassembler) and packs, as Panfrost's
+  preload path does, the renderer state, blend, unnormalised nearest
+  sampler, BGRA8 linear texture, varyings, pre-frame DCD (mode ALWAYS), MFBD
+  with the panel as RT (writeback swizzle B,G,R,A) and the fragment job into
+  `tools/dreamlte/s8_mali_blit.h` (base `0x8a0000000`, right after XNU's
+  512 MiB). With `sweetfb_gpu=1` AppleCLCD powers and resets the Mali, sets
+  AS0 IDENTITY, copies the blob, and for a full-screen BGRA layer in a
+  physically contiguous IOSurface (allocated contiguous for surfaces
+  >= 4 MiB) cleans the CPU cache, patches texture size/pointer/stride and
+  the source corners and runs the fragment job instead of the CPU copy;
+  errors fall back to the CPU copy, three switch the GPU path off.
+
+Step 1, loader `gpu_probe.c` with `s8gpu=1`: log/enable S2MPS17 BUCK6
+(`vdd_g3d`), run Samsung's `g3d_on` (CMU_G3D `0x13800000`, PMU `0x40E0`/
+`0x40E4`) and, only if the domain reports on, read `GPU_ID`/`L2_FEATURES`/
+`SHADER_PRESENT` at `0x13900000` (Mali-G71 = product `0x6000`). Next steps:
+a polled XNU GPU driver (power, MMU page tables, job slots) after the ID
+answers; then a userland Metal plugin that CoreAnimation can load.
+
+GPU: iOS draws through Metal on Apple's GPU only (AGX); the Mali-G71 runs
+under Linux (Panfrost, see LinuxS8) but no iOS driver can use it. Graphics
+stays CPU-rendered; the speed levers are more cores, the A53 clock (S-Boot
+leaves ~1050 of 1690 MHz; Linux sets it through the ACPM DVFS plugin, which
+Linux itself loads from firmware files) and zero-copy scanout from the
+IOSurface (DECON IDMA base, probe in progress).
+
+## Next (as of 04b4172, superseded: see the last section)
+
+1. Boot `04b4172` + the eight-core change with `cpus=8 s8mngsdbg=1`: check
+   tearing and the Mongoose lines above.
+2. If a Mongoose core still does not run its entry: compare the PLL dump
+   with CPUCL1, and try the cluster sequence with the core powered before the
+   cluster (`cluster0_on` after `CONFIGURATION`).
+3. Zero-copy scanout: make DECON fetch from a moved IDMA base.
+
+## Boot 43 (prepared, not yet run): A53 boost
+
+- Boot 42 confirmed Mali presentation but only 1–17 swaps per 10 s; the
+  limit is CoreAnimation's CPU renderer on four A53 cores at 970.67 MHz
+  (BUCK3 0x49 = 756 mV).
+- New loader flag `s8boost=1` (`pmic_cpu_boost`): BUCK3 to 0.95 V, then
+  PLL_CPUCL1 to 1449.5 MHz (M/P/S 223/4/0, Samsung table entry) using the
+  ra_pll_set_pmsk order; restores the old PMS on lock timeout. Logs
+  `A53 boost ok|FAILED` and `cpu MHz` (echoed as `S8 LOADER|`).
+- Image: boot-42 kernel (run 39660815102) + new loader, sha256
+  1faee463fc1b8c5efd81d8ed989b11b9bd0e51e5f7d86868d508a6dca15275fa.
+- Result (boot 43 logs): `A53 boost FAILED, restored`, `cpu MHz=0x1a`
+  (26 MHz). The S-Boot CL1 PLL was 0xa0f30311 (M/P/S 243/3/1, stable).
+  After disable/LOCKTIME/enable neither the new PMS (223/4/0) nor the
+  restored old PMS set STABLE within 10 ms; the PLL read 0x80f30301
+  (enabled, not stable) and the mux stayed on the 26 MHz input, so iOS
+  ran on the oscillator: 3 swaps per 10 s, GPU copy 115 ms. BUCK3 did go
+  to 0x68. This is the same failure as the CL0 relock in boots 33-34:
+  toggling PLL_CON0 bit 31 on these CPU PLLs does not relock under our
+  loader. `s8boost=1` must not be used; the boot-42 command line is the
+  working baseline.
+
+## Boot 44 (prepared, not yet run): iOS programs on the Mali
+
+Goal: the first step of iOS rendering on the GPU. An iOS user process, not
+the kernel, must get GPU memory and run Mali jobs.
+
+- Kernel (CI run 39666116520, commit d2f572a): `/dev/s8mali` (cloning
+  cdev, `bsd/dev/dreamlte_s8.c`; ioctls in `tools/dreamlte/s8mali_ioctl.h`,
+  served in `s8_gpu_present.inc`). GPU memory comes from a 512 MiB pool at
+  0x8b0000000 (outside XNU's RAM), mapped GPU VA = PA and write-combined
+  in the process. Jobs run on any slot, serialised with the kernel's frame
+  presentation by one IOLock. Mali page-table pool grown to 512 pages.
+- Boot overlay: `tools/dreamlte/mkoverlay.py` archive in the payload
+  (`mkpayload.py --overlay`, ADT `/chosen/memory-map` `S8Overlay`), written
+  to the root before launchd (`dreamlte_bsd_late` in `bsd_init`).
+- iOS program `tools/dreamlte/ios/s8gputest.c` (clang + ld64.lld, ad-hoc
+  signed) installed as `/usr/appleinternal/sbin/launchd.s8`; with
+  `launchdsuffix=s8` it runs as pid 1, logs `S8 MALI| ...`: WRITE_VALUE on
+  slot 1, a full-screen 1440x2960 clear on slot 0 checked by sampling, 60
+  timed frames; then execs `/sbin/launchd`.
+- Image: boot-42 command line + `launchdsuffix=s8`, no `s8boost`; sha256
+  ebee2ff293cde19f65e7750dc3c0ed9c45bdaaf71120b6bc15dfb5706ec717ee.
+  Result (boot 44 logs): `S8 MALI: /dev/s8mali major 19 ready`; GPU
+  present on as before; but the overlay got EROFS (30) for
+  `/usr/appleinternal` and ENOENT for the rest: before launchd the HFS+
+  root is still read-only (launchd's mount_hfs remounts it later), so the
+  test never ran and the normal launchd started. User report: still laggy
+  (SWEET FB 2-100 swaps per 10 s). Expected log lines were: `S8 MALI: /dev/s8mali
+  major`, `S8 OVERLAY: ... written`, `S8 MALI| ... USER GPU JOB WORKS`,
+  `USER GPU DRAW WORKS`, `60 full-screen GPU frames: avg ...`.
+- If pid 1 dies before the exec the kernel panics ("init died"); then
+  boot 42 is the fallback.
+
+## Boot 45 (prepared, not yet run): read-write root for the overlay
+
+- Kernel CI run 39669193497 (commit fc97d7c): with `rootrw=1` the root is
+  mounted read-write from the start (A5XELTE copy of SWEET patch 0031's
+  vfs_subr hunk), so the overlay can write `launchd.s8` before launchd.
+- Same command line and overlay as boot 44; sha256
+  bb8fb1f3756d08a944fc13e09084bc2c5d2263d32f138c05523e06ec9ee50020.
+- Research for the Metal path (iPhone X 16.7.16 shared cache, local only):
+  Metal.framework and IOGPU read `MetalPluginName` / `MetalPluginClassName`
+  from the accelerator's IORegistry entry and load that bundle from
+  /System/Library/Extensions (AGXMetalA11 on a real A11). Plan: the kernel
+  publishes a Mali accelerator entry naming our own plugin bundle, which
+  implements MTLDevice on /dev/s8mali.
+
+## Boot 45 result and boot 46 (prepared, not yet run)
+
+- Boot 45 (root mounted read-write from the start): the screen stopped at
+  the kernel banner; pmsg ended at `JUMP TO XNU` and the USERDATA log
+  ring still held boot 44 (byte-identical), so the kernel wrote nothing.
+  Cause not proven; the read-write mountroot was the only functional
+  change, so it is reverted.
+- Boot 46 (CI run 39672025527, commit ff3f28f): root mounts read-only as in
+  boot 44; a kernel thread waits until launchd has remounted it writable
+  and then installs the overlay (`S8 OVERLAY: root writable after N s`).
+  `launchd.s8` therefore runs from the boot after that: boot 46 twice.
+  sha256 13d3f772bbd7f3c4bf203825a5b9fe253d5c57d1ffec2c2ca82d551d7a20ee93.
+- Boot 46 result (logs of the second boot): overlay installed on the first
+  boot (`root writable after 1 s`, 3 written). On the second boot pid 1
+  (`launchd.s8`, an ad-hoc signed iOS program) used `/dev/s8mali`:
+  `WRITE_VALUE slot1 ... USER GPU JOB WORKS` (85 us),
+  `FRAGMENT 1440x2960 clear: 3120/3120 samples ... USER GPU DRAW WORKS`,
+  `60 full-screen GPU frames: avg 1162 us, worst 1220 us`, then
+  `exec /sbin/launchd`; iOS booted normally. So an iOS process can drive
+  the Mali, and a full-screen fragment pass (clear + tile writeback) costs
+  ~1.2 ms. iOS itself still swaps at most ~10 frames/s (SWEET FB 100-102
+  swaps per 10 s under load) with CoreAnimation rendering on the CPU.
+
+## Boot 47 (prepared, not yet run): Metal stage 1, diagnostic
+
+- Kernel CI run 39676237484 (commit a4b8bf3). Boot-arg `s8metal=1`
+  publishes `S8MaliAccelerator` (class IOAcceleratorES) naming
+  `S8MaliMetal.bundle` / `S8MaliDevice`; the overlay installs the bundle.
+- Stage 1 device logs each unimplemented message (`S8 MALI| MTL -[MTLDevice
+  ...] unimplemented`) and answers nil/0, so CoreAnimation is expected to
+  fail to draw (black screen or backboardd restarts) in this boot: it is a
+  diagnostic boot; boot 46 restores the normal UI.
+- sha256 a95e125959201fec3d3b9bfd6dc2713973f3ec321f562077f9d4dcf78235cc30.
+- Boot 47 result: overlay installed the bundle; Metal loaded it and every
+  process creating a Metal device logged `MTL device created on accelerator
+  port ...`, but backboardd aborted at once in a loop: `failed assertion
+  [newDevice conformsToProtocol:@protocol(MTLDevice)] at line 834 in
+  MTLAddDevice` (so no `unimplemented` lines yet; the phone never reached
+  the UI).
+
+## Boot 48 (prepared, not yet run): Metal stage 1b
+
+- Same kernel as boot 47; the plugin now adopts MTLDevice / MTLDeviceSPI
+  (declared by name; the runtime unifies them with Metal's). Diagnostic
+  boot again. sha256 recorded with the image below.
+  sha256 174c540996925dab8c807a896bc14667e037d9d2a8e92c091c56be336ebaa53f.
+- Boot 48 result: protocol check passed; CoreAnimation asked the device for
+  `featureProfile` and `maxBufferLength` (logged as unimplemented), then
+  `CA::OGL::new_metal_context` returned NULL (no command queue) and
+  backboardd crashed in `CA::WindowServer::EAGLServer::renderer` (NULL
+  context) in a loop.
+
+## Boot 49 (prepared, not yet run): Metal stage 2, object model
+
+- Same kernel (run 39676237484). S8MaliMetal stage 2 (tools/dreamlte/metal/
+  s8mtl_*.m): device (featureProfile 5, no tile shaders / memoryless / ROG),
+  command queue and buffers on Metal's _MTLCommandQueue/_MTLCommandBuffer
+  (submit runs the work, completion on a serial dispatch queue), render /
+  blit / compute encoders, buffers and textures in /dev/s8mali memory,
+  IOSurface textures through the CPU mapping, own library objects (reads
+  the metallib function list) and pipeline objects. Clears and blits run on
+  the CPU; draws are only counted. Logs: `MTL pipeline N: vs ... fs ...`,
+  `fs constants`, `MTL command buffer ...`, `unimplemented`.
+- Diagnostic: the UI will not draw (draws skipped). sha256 b484c819c17a3f94e25105026eccd1ff4a02cc3050ade7fb2039959b3c706cc9.
+- Boot 49 result: no backboardd crash. CoreAnimation ran on the Mali
+  device: QuartzCore default.metallib (141 functions) loaded through the
+  driver's library, 88 render pipelines created, command buffers of 3-21
+  passes and 16-54 draws completed (35491 draws counted in ~3 min). With
+  draws skipped the display ran at up to 327 swaps per 10 s, the
+  sweetfb_hz=30 cap, against <= ~100 with CoreAnimation's CPU renderer.
+  Pipelines: fixed_vert_lph_spc + fixed_frag_lph_cph (39 constant sets),
+  std_vert0/1, downsample_blur_vert, downsample_4/8, narrow_blur_7..27,
+  single_pass_blur_3, variable_blur, home_affordance_base, inplace_copy,
+  luma_boost, p3_clamp, harmony, display_overdrive_*, attachment_clear;
+  colour formats 80 (BGRA8) and 550/551/554 (XR display formats), 115.
+  The constants' -description has no values (next: read them).
+  Still unimplemented: command buffer/texture protectionOptions,
+  -[MTLBuffer newLinearTextureWithDescriptor:...], instanced indexed draws,
+  supportsVertexAmplificationCount:. Memoryless textures got no memory.
+
+## Shader compiler (host): air2nir
+
+- tools/dreamlte/metal/air2nir.cpp + build-air2nir.sh: AIR bitcode from
+  QuartzCore's default.metallib -> LLVM 18 specialisation (function
+  constants, air.static_init evaluated by GlobalOpt, inlining, -O2) ->
+  NIR (unstructured, nir_lower_goto_ifs) -> Mesa 25.2.8 Bifrost (v6)
+  compiler. Verified on the host: std_vert1_lph (992 bytes of Bifrost
+  code: LD_ATTR, UBO load, FMA, varying stores), read_surf_frag, and
+  fixed_frag_lph_cph in its generic mode (fc_generic=1, 154768 bytes).
+  Textures, samplers and constant-buffer pointers are binding indices /
+  (UBO << 32 | offset) values so run-time selection works.
+- The SDK used to build the plugin with real headers comes from
+  github.com/theos/sdks (iPhoneOS16.5.sdk), local only.
+
+## Boot 50 (prepared, not yet run): constants for the shader compiler
+
+- Plugin only (kernel as boot 47-49): logs each pipeline's function-constant
+  values (`MTL pipeline N fs consts+K: name=0x..;...`), implements the
+  calls boot 49 listed as missing, memoryless textures get memory.
+- Still diagnostic (draws skipped). sha256 4eb58e0db68b5c0dccdf81357e320330a34339d912472badebe8fc3a1922d9cb.
+
+## Boot 50 result and Metal stage 3 (in progress, nothing new booted yet)
+
+- Boot 50 (observed): CoreAnimation stable on the Mali Metal device, the
+  constants were logged but cut at 119 characters per line (kernel log
+  limit). fixed_frag uses fc_framebuffer_fetch=1. The user stays on boot 46
+  for normal use.
+- Kernel (built, CI run 39690299113, commit b05b3b6; not booted yet):
+  S8MALI_MAP_SURFACE maps an IOSurface into one of 16 x 32 MiB GPU windows
+  (LRU), optional clean+invalidate of the CPU caches; page-table pool 4 MiB.
+- air2nir -D (commit 69a66c8 and later): function constants are read at run
+  time from UBO 29 (index*16 value, +8 "defined"); the static initialiser
+  runs in the entry point, the globals it writes become allocas (selects
+  between such a global and a buffer are pushed down to the loads).
+  Constant tables -> UBO 28, framebuffer-fetch conversion words -> sysval
+  UBO 31 at 32 + (rt*2 + is16)*4. S8SH v2 adds the constant table, RT
+  register formats, constant data, tls_size, writes_point_size.
+  "@preload" builds the render target reload frame shader.
+- build-shaders.py: whole QuartzCore metallib -> one cache (S8SC):
+  133/135 entries (all but inplace_copy_lpf/lph: image stores), 955 KB;
+  36 varying names coloured into 5 VAR slots. fixed_frag_lph_cph as one
+  run-time-constant binary: 360 KB.
+- build-mesa-ios.sh: libs8mesa.a (37 objects) incl. fixed-function
+  blending extracted from pan_blend.c.
+- Next (not written yet): tools/dreamlte/metal/s8mtl_draw.c — the Mali
+  command stream after PanVK JM: per pass tiler heap/context, TLS, FBD
+  (pan_emit_fbd), fragment job, preload DCD for LoadActionLoad; per draw
+  vertex COMPUTE job + TILER job (attributes from the pipeline's vertex
+  descriptor, varyings linked as panvk link_shaders with the FS formats,
+  UBO table 0..31, textures via pan_sampled_texture_emit, samplers,
+  fixed-function BLEND, viewport scale (-h/2 for Metal's y-up NDC));
+  submit slot 1 then slot 0. Inline sampler states (AIR i64): bits 0-8
+  address s/t/r (3 bits each; 0 clamp_to_zero?, 1 clamp_to_edge,
+  2 repeat), bits 9/11/13 mag/min/mip linear (decoded from CA's values,
+  unverified). Then raise sweetfb_hz to 60.
+
+## s8-network branch (2026-10-21, merged 2026-10-23)
+
+The sections below were written on the `s8-network` branch, in parallel with
+the GPU/Metal work above. Both started from `04b4172`.
+
+## Console filter (patch 0125)
+
+Boot-arg `sweetlog=WORD,WORD,...` draws on the screen only the console lines
+that contain one of the words; `-WORD` hides lines with that word (with only
+`-` words every other line is drawn). A panic is always drawn and the
+persistent log still gets every line. A plain number (`sweetlog=0`/`1`) keeps
+its old meaning (persistent log off/on) and is not a filter. Example:
+`sweetlog=S8WLAN,S8CHG,panic` or `sweetlog=-hfs,-AMFI`. Ported from
+MakrSas/ios-topaz 0112. Not yet built in CI or tried on the phone.
+
+## Wi-Fi step 1 (patch 0126, 2026-10-21)
+
+`bsd/dev/s8_wlan.c`, boot-arg `s8wlan=N` (steps 1..N), written after
+MakrSas/LinuxS8 `pcie-exynos8895.c` + quirk and brcmfmac. Started once when
+the root search begins; with no root found it waits for the steps (max 60 s)
+before the root-device panic. Locally built kernel, BOOT image with
+`ufsroot=NOSUCHPART` (no UFS writes; the test phone carries LinuxS8 Debian).
+
+Phone result (photo), all 5 steps:
+- survey: S-Boot leaves the FSYS1 PCIe gates on (0x200000), PMU PCIe PHY 0;
+- power: WLAN_REG_ON gpj1-3 high (dat 0x2b), PMU PHY control 0x1;
+- link: up on try 3 (LTSSM 0x3607d11); tries 1-2 fail as under Linux;
+- config: endpoint `0x441f14e4`, class 0x280000, BAR0 32 KiB, BAR2 4 MiB;
+- bars: ChipCommon chip id `0x10034361` = BCM4361 rev 3.
+
+Next: firmware + NVRAM download to TCM (rambase 0x170000), wait for the
+shared-RAM address, then msgbuf rings.
+
+## Speed work (2026-10-21, patches 0127-0133, local Mac builds)
+
+Measured with patch 0128 (S8FPS: present rate and copy cost) and 0129
+(S8LOAD per-CPU user/system/idle every 10 s, S8TOP top tasks, S8VM):
+- The panel copy is cheap (5-8 ms per frame); backboardd itself submits
+  only ~0.6-1.5 frames per second.
+- With 4 A53s all CPUs were 100% busy: crash loops (xpcproxy 4862,
+  fairplayd.H2 1296, bluetoothd 1291, nanotimekitcompaniond 1263 launches in
+  one session, each a dyld start + crash report), `vmd` spinning a whole core,
+  launchd ~0.35 core. **0130 `s8noexec=NAME,...`** refuses such programs at
+  exec (no crash report). Used: `s8noexec=vmd,bluetoothd,fairplayd.H2,
+  nanotimekitcompaniond,locationd,WirelessRadioManagerd,CommCenterMobileHelper`.
+- **Mongoose cluster runs: `cpus=8` brings up all eight cores** (plain PSCI
+  CPU_ON + the existing PMU power-up, with the loader's mngs_probe not run).
+  Needed: 0131 (SweetCPU matches `samsung,mongoose-m2`), 0132 (the
+  single-cluster clutch scheduler's steal_thread returned with the pset lock
+  held: thread_select re-took it and panicked), 0133 (both clusters in one
+  pset: the clutch scheduler enqueued under the wrong pset lock with two).
+  The loader's mngs_probe must not run before (it was disabled locally for
+  these boots; it powers the cluster itself).
+- With 8 cores the CPUs are no longer saturated (idle 15-65% while touching),
+  yet backboardd spends ~1.6 CPU-seconds per frame: something per frame is
+  pathologically expensive. Next: profile backboardd.
+- 0127: ACPM. The DVFS plugin is not resident; Samsung's kernel loads
+  exynos8895_acpm_dvfs.fw (from its firmware/ dir) into APM SRAM and
+  attaches it. Loading + detach of plugin 2 + attach of plugin 3 over channel
+  4 works (acknowledged), but FREQ_REQ on the buffer-type channels (3 by owner
+  mask, 5 by DT) is not answered and the PLLs do not change (A53 1053 MHz,
+  Mongoose 1066 MHz). The firmware binary is not in this repository: a local
+  `bsd/dev/s8_acpm_dvfs_fw.h` supplies it.
+- RAM: `S8_DRAM_MIB=1024 make-boot.sh ...` gives XNU 1 GiB (boots fine).
+
+## CPU clocks through ACPM work (2026-10-21, patch 0127)
+
+The DVFS plugin answers on **channel 0** (a queue channel), not on the
+buffer-type channels 3/5: Samsung's acpm_dvfs.ch_num stays 0 when its channel
+lookup runs before the cal-if probe, so the vendor kernel itself uses index 0.
+Rates must be levels of the plugin's fvmap (rate/voltage tables right after
+the plugin in SRAM; header o_ratevolt at +0x14). Read from the phone:
+- A53 (id 3): 2002 1898 1794 **1690** 1456 1248 1053 949 832 715 598 455 MHz
+- Mongoose (id 2): 2808 2704 2652 2574 2496 **2314** 2158 2002 1937 1807 1703
+  1469 1261 1170 1066 962 850 741 MHz
+With `s8cpufreq=1690000 s8cpufreq_big=2314000` the PLLs read back 1690 and
+2314 MHz (from 1053 / 1066). The firmware sets the voltages.
+Raising MIF (id 0) to its top level froze the phone with a display underrun
+stripe: Samsung coordinates MIF switches with DECON. MIF/INT are now only
+touched with explicit `s8mif=`/`s8int=`.
+
+Profile (0134 `s8prof=backboardd`): the remaining frame cost is CoreAnimation's
+software renderer (CA::OGL::SW image_sampler, vAlpha_Blend, memset_pattern16);
+note the sampler also counts parked workqueue threads (workq_kernreturn,
+start_wqthread), which are idle, not busy (S8WQ: ~70 creations per session).
+
+## GPU step 1 (patch 0135, 2026-10-21)
+
+`s8g3d=455000` asks ACPM for the G3D clock (dvfs_g3d, id 4): PLL_G3D reads
+back 455 MHz (0xa08c0411); the firmware sets the voltage. `s8gpu=1` logs:
+pd_g3d status 0x3000f (on), GPU_ID 0x60a00001 (Mali-G71 r0p0), L2 0x7130206,
+tiler 0x809, mem 0x301, MMU 0x2830, AS 0xff, JS 0x7, shader present
+0x17771777 (20 cores), IRQ raw 0x100 (reset completed). Same as LinuxS8's
+panfrost probe.
+ACPM tables read on the phone: MIF (id 0) 2093/2002 (voltage 0: disabled)
+1794 1540 1352 1014 845 676 546 421 286 208 MHz; INT (id 1) 667 533 400 333
+267 178 107 MHz (667 works); G3D (id 4) 839/764/683 (disabled) 572 546 455
+385 338 260 MHz. The MIF freeze above asked for 2093 MHz, a disabled level.
+
+## GPU runs its first job (patch 0135, s8gpu=3)
+
+Soft reset, L2 + 20 shader cores + tiler powered (ready 0x1 / 0x17771777 /
+0x1). Address space 0 with Mali LPAE page tables (4 levels; table = pa | 3,
+leaf = pa | 1 (block) | HAP read 1<<6 | HAP write 2<<6 | SH_OS 2<<8, attr
+index 0; Mali LPAE has stage-1 attributes but stage-2 permissions: the first
+try with AP_UNPRIV/nG faulted 0xC8 on the write), MEMATTR 0x88/0x8d/0x88,
+TRANSCFG legacy. A WRITE_VALUE job (v6 header type 2, Immediate 32) on slot 1
+stores 0xCAFEBABE: job IRQ 0x2, no MMU fault, header exception 0x1, the CPU
+reads 0xcafebabe back. Next: a kernel interface for userspace (panfrost
+ioctls: BO create/mmap, submit, wait) and Mesa panfrost for iOS.
+
+## GPU from userspace, Wi-Fi firmware running, hands-free test boots (2026-10-21)
+
+- **0136 S8GPU** (boot-arg s8gpu=4): IOKit service + user client answering
+  panfrost DRM requests (GET_PARAM, CREATE_BO, MMAP_BO, GET_BO_OFFSET, SUBMIT
+  (synchronous), WAIT_BO, MADVISE); per-client GPU address space (AS 1-7),
+  wired buffers mapped write-combined into the client. tools/dreamlte/
+  s8gpu-test.c (a launchd job in the root) creates two buffers, submits a
+  WRITE_VALUE job: "GPU WROTE IT FROM USERSPACE".
+- 0130 also marks binaries in /usr/local/bin as platform binaries (launchd
+  panics on a non-platform binary among its system jobs).
+- `s8int=667000` (INT bus at its top level while MIF stays low) correlates
+  with SHA-256 data aborts in code-signing page checks: left out.
+- **0126 Wi-Fi step 6**: EROM scan (ChipCommon, 2x D11, ARM CR4 rev 13, PCIe2
+  rev 23, ...), CR4 halted, TCM 1344 KiB, firmware + NVRAM written at
+  rambase 0x170000 through BAR2, ARM released: the firmware publishes its
+  shared area (0x1fc8b4, flags 0x30040007: msgbuf protocol 7). Firmware and
+  NVRAM come from a local header (not in this repository).
+- **0129 s8autotwrp=N**: N seconds after boot the kernel writes the log out
+  and reboots into TWRP (PMU INFORM2 0x12345678, INFORM3 0x12345674, as
+  Samsung's sec_reboot.c, then SWRESET): test boots need no button presses.
+
+## Merge of the two branches and where we stopped (2026-10-23)
+
+The GPU/Metal work (`claude/gracious-hawking-jjkfp0`, up to `fa99d7a`) and
+`s8-network` (up to `be6fc5e`) are merged. Nothing from this merge has been
+built in CI or booted yet.
+
+- `0124` was regenerated with `apply-dreamlte.py` on a local replay of
+  xnu-8796.141.3 + 0001-0123. It matches the Metal branch's 0124 except for
+  the touch enable sequence. That sequence now combines both branches: up to
+  20 tries, a bus reset and 50 ms between tries, and the failing register in
+  the error line.
+- `0125`-`0136` (s8-network) were rebased onto the new 0124 by a 3-way git
+  rebase. Two conflicts came up:
+  - 0128: both stat blocks are kept. The Metal branch's `SWEET FB: 10s` and
+    s8-network's `S8FPS` both measure presents.
+  - 0133: the Metal branch's 0124 already sets `phys_cluster_id = 0` on
+    DREAMLTE, so 0133 only adds the comment.
+- All 0124-0136 apply with plain `git apply` in order, which is the CI path.
+- Two independent GPU interfaces are now in the kernel. They are selected by
+  boot-args:
+  - s8-network: `S8GPU` IOKit user client (panfrost requests, `s8gpu=4`) and
+    `s8_gpu.c` (`s8gpu>=1`).
+  - Metal branch: `/dev/s8mali` (`dreamlte_s8.c`), `sweetfb_gpu=1` and
+    `s8metal=1`.
+
+  Do not enable both at once: each resets and powers the Mali itself.
+- Mongoose: the two branches used different start paths.
+  - s8-network reached eight cores with `cpus=8`. It used XNU's PSCI
+    CPU_ON + PMU power-up, with the loader's `mngs_probe` disabled locally.
+  - The merged loader still runs `mngs_probe` and caps `cpus`. That path has
+    never started a Mongoose core.
+  - New loader boot-arg **`s8mngs=0`**: skips the probe and the cap.
+  - The merged 0124 also runs `cluster0_on` in `SweetCPU::startCPU`. That
+    code is from the Metal branch and is untested.
+- Local-only inputs:
+  - Wi-Fi firmware/NVRAM header (`s8_wlan_fw.h`) and ACPM DVFS firmware
+    header (`s8_acpm_dvfs_fw.h`). Both are `__has_include` optional, so a CI
+    kernel builds without them but does no Wi-Fi step 6 and no CPU clocks.
+  - SDK and Mesa for the Metal plugin.
+
+### Next
+
+1. CI kernel build of the merged tree. For CPU clocks and Wi-Fi, build
+   locally with the firmware headers.
+2. Boot the merged kernel with the known-good boot 46 arguments. Check:
+   - touch, frames, `SWEET FB`/`S8FPS` lines;
+   - then `cpus=8 s8mngs=0` with the s8-network `s8noexec=` list and
+     `s8cpufreq=1690000 s8cpufreq_big=2314000`.
+3. Metal stage 3: `tools/dreamlte/metal/s8mtl_draw.c` (Mali job chain per
+   pass and draw, see "Boot 50 result" above). Then raise `sweetfb_hz` to 60.
+4. A Remote Control session on the user's computer can flash BOOT, reboot
+   (`s8autotwrp=N` returns to TWRP by itself) and pull the logs
+   (`tools/dreamlte/pull-sweetlog.sh`) without the user.
+
+## Metal stage 3: draws on the Mali (2026-10-23, built, not yet booted)
+
+- `tools/dreamlte/metal/s8mtl_draw.c` (C, Mesa 25.2.8 genxml v6 headers +
+  libs8mesa.a) turns each recorded render pass into Mali job chains, after
+  PanVK's job-manager path:
+  - per pass: thread storage, tiler heap (32 MiB, shared) and context, MFBD
+    + one RGB render target (clear colour, or the `@preload` frame shader
+    for MTLLoadActionLoad), one FRAGMENT job on slot 0;
+  - per draw: a VERTEX job and a TILER job on slot 1, with UBO table 0..31,
+    32 textures (31 = 1x1 null), 32 samplers (16+ inline), vertex
+    attributes from the pipeline's vertex descriptor, varyings linked by
+    location (vertex outputs to the fragment shader's formats, as PanVK
+    link_shaders), viewport/scissor, fixed-function blend from the
+    pipeline's blend state.
+  - UBO 31 layout: viewport scale 0 / offset 16, render target conversion
+    32 + (rt*2 + is16)*4, first vertex 96, texture sizes 128 + index*8.
+- The Objective-C encoders record into it. IOSurface targets and textures are
+  mapped with S8MALI_MAP_SURFACE (FLUSH) at bind time. A pass the GPU path
+  cannot take falls back to stage 2.
+- Host test `tools/dreamlte/metal/test/build-draw-test.sh`: s8mtl_draw.c
+  against a fake /dev/s8mali, every job chain decoded by Mesa's pandecode.
+  It found two bugs before any boot: 0-entry UBO descriptors, and unused
+  varying slots linked as positions.
+- air2nir fixes: inline sampler states and constant tables were never
+  written (self-assignment). New lowerings: load_raw_vertex_offset_pan
+  (most failing vertex shaders) and txs (blur and fixed_frag shaders).
+- The local Windows/WSL build of the shader cache gave 104/135 functions
+  (Mesa built with assertions). The earlier 133/135 was likely a build
+  without assertions, so those back-end failures went unnoticed. Rebuild in
+  progress with the lowerings above.
+- Boot plan: kernel CI run 39976717941 (merge 504134c, includes
+  S8MALI_MAP_SURFACE), boot-50 command line, overlay = bundle with the draw
+  path + `quartzcore.s8sc`. Boot twice: the overlay installs on the first
+  boot, the plugin is used from the second.

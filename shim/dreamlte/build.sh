@@ -16,14 +16,15 @@ $CC $CFLAGS -c smp_probe.c -o out/smp_probe.o
 $CC $CFLAGS -c touch_probe.c -o out/touch_probe.o
 $CC $CFLAGS -c pmic.c -o out/pmic.o
 $CC $CFLAGS -c display_probe.c -o out/display_probe.o
-objs="out/loader.o out/fdt.o out/ufs_probe.o out/smp_probe.o out/touch_probe.o out/pmic.o out/display_probe.o"
+$CC $CFLAGS -c gpu_probe.c -o out/gpu_probe.o
+objs="out/loader.o out/fdt.o out/ufs_probe.o out/smp_probe.o out/touch_probe.o out/pmic.o out/display_probe.o out/gpu_probe.o"
 # Runs wherever S-Boot puts it with no relocation pass.
 abs=$(aarch64-linux-gnu-readelf -r $objs | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations" >&2; exit 1; }
 $CC $CFLAGS -static -T loader.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N \
 	out/start.o $objs -o out/loader.elf
 $OBJCOPY -O binary out/loader.elf out/Image
-size=$(aarch64-linux-gnu-nm out/loader.elf | awk '$3=="_end"{print strtonum("0x"$1)}')
+size=$((0x$(aarch64-linux-gnu-nm out/loader.elf | awk '$3=="_end"{print $1}')))	# any awk (mawk has no strtonum)
 truncate -s "$size" out/Image
 echo "out/Image: $(stat -c %s out/Image) bytes"
 if [ $# = 3 ]; then

@@ -34,6 +34,14 @@
 #define LDO_EN			(3u << 6)
 #define L34_1V85		(LDO_EN | (1850000 - 700000) / 25000)
 #define L35_3V0			(LDO_EN | (3000000 - 1800000) / 25000)
+#define B2CTRL			0x1b	/* BUCK2 vdd_cpucl0 (Mongoose) */
+#define B2OUT			0x1c
+#define B3CTRL			0x1d	/* BUCK3 vdd_cpucl1 (A53) */
+#define B3OUT			0x1e
+#define B6CTRL			0x23	/* BUCK6 vdd_g3d (Mali) */
+#define B6OUT1			0x24
+#define BUCK_EN			(3u << 6)	/* S2MPS17_ENABLE_MASK */
+#define BUCK_VSEL(uv)		(((uv) - 300000) / 6250)	/* BUCK_MIN1, STEP1 */
 #define RTC_UPDATE		0x02
 #define RTC_RUDR		0x01
 #define RTC_SEC			0x04
@@ -136,4 +144,128 @@ uint64_t pmic_init(void (*kv_fn)(const char *, uint64_t), void (*out_fn)(const c
 	kv(" sec..year", raw);
 	out("\n");
 	return raw;
+}
+
+/*
+ * Mongoose cluster rail. Boot 33: with its cores powered in the PMU the
+ * cluster's NONCPU and L2 status stayed off and its PLL never locked. The
+ * rail is S2MPS17 BUCK2 "vdd_cpucl0" (dream2lte_common.dtsi: 0.45-1.2 V,
+ * regulator-always-on, so Samsung's Linux switches it on itself; S-Boot
+ * may leave it off). Log BUCK2 next to BUCK3 (the running A53 rail); if
+ * BUCK2 is not enabled, set at least 0.8 V (1066 MHz is the PLL's boot
+ * rate) and enable it.
+ */
+void pmic_mngs_rail(void)
+{
+	out("MNGS rail");
+	show(" b2ctrl", SLAVE_PMIC, B2CTRL);
+	show("b2out", SLAVE_PMIC, B2OUT);
+	show("b3ctrl", SLAVE_PMIC, B3CTRL);
+	show("b3out", SLAVE_PMIC, B3OUT);
+	out("\n");
+	int ctrl = speedy(SLAVE_PMIC, B2CTRL, 0, 0);
+	int vsel = speedy(SLAVE_PMIC, B2OUT, 0, 0);
+	if (ctrl < 0 || vsel < 0 || (ctrl & BUCK_EN) == BUCK_EN)
+		return;
+	if (vsel < BUCK_VSEL(800000) || vsel > BUCK_VSEL(1100000))
+		speedy(SLAVE_PMIC, B2OUT, 1, BUCK_VSEL(800000));
+	speedy(SLAVE_PMIC, B2CTRL, 1, (uint8_t)(ctrl | BUCK_EN));
+	delay_us(1000);			/* 12 mV/us ramp: < 100 us */
+	out("MNGS rail on");
+	show(" b2ctrl", SLAVE_PMIC, B2CTRL);
+	show("b2out", SLAVE_PMIC, B2OUT);
+	out("\n");
+}
+
+/*
+ * Mali rail: S2MPS17 BUCK6 "vdd_g3d" (dreamlte_common.dtsi: 0.45-0.85 V,
+ * regulator-always-on). Log it; if it is not enabled, set 0.8 V and
+ * enable it.
+ */
+void pmic_g3d_rail(void)
+{
+	out("G3D rail");
+	show(" b6ctrl", SLAVE_PMIC, B6CTRL);
+	show("b6out1", SLAVE_PMIC, B6OUT1);
+	out("\n");
+	int ctrl = speedy(SLAVE_PMIC, B6CTRL, 0, 0);
+	int vsel = speedy(SLAVE_PMIC, B6OUT1, 0, 0);
+	if (ctrl < 0 || vsel < 0 || (ctrl & BUCK_EN))
+		return;
+	if (vsel < BUCK_VSEL(600000) || vsel > BUCK_VSEL(850000))
+		speedy(SLAVE_PMIC, B6OUT1, 1, BUCK_VSEL(800000));
+	speedy(SLAVE_PMIC, B6CTRL, 1, (uint8_t)(ctrl | BUCK_EN));
+	delay_us(1000);
+	out("G3D rail on");
+	show(" b6ctrl", SLAVE_PMIC, B6CTRL);
+	show("b6out1", SLAVE_PMIC, B6OUT1);
+	out("\n");
+}
+
+/*
+ * BROKEN (boot 43): the PLL never relocks and the cluster is left on the
+ * 26 MHz input. Do not boot with s8boost=1.
+ *
+ * "s8boost=1": raise the A53 cluster from S-Boot's 970.67 MHz to 1449.5 MHz,
+ * an entry of Samsung's pll_cpucl1_rate_table (M/P/S 223/4/0). Boot 42
+ * showed iOS bound by CoreAnimation's CPU renderer. Voltage first: BUCK3
+ * read 0x49 (756 mV); 1456 MHz needs at most ~0.9 V in the 8895 ASV
+ * table, so set 0.95 V. Then Samsung's ra_pll_set_pmsk order: mux to the
+ * 26 MHz input, disable, LOCKTIME = P * 150, new PMS + enable, wait for
+ * STABLE, mux back. On a lock timeout the old PMS is restored.
+ */
+#define CMU_CPUCL1		0x16900000UL
+#define PLL_LOCKTIME		0x0000
+#define PLL_CON0		0x0120
+#define PLL_EN			(1u << 31)
+#define PLL_STABLE		(1u << 29)
+#define PLL_MUX_BUSY		(1u << 7)
+#define PLL_MUX_SEL		(1u << 4)
+#define PLL_PMS_MASK		((0x3ffu << 16) | (0x3fu << 8) | 7u)
+#define PLL_PMS(m, p, s)	((m) << 16 | (p) << 8 | (s))
+
+static int pll_set(uint32_t pms)
+{
+	uintptr_t con = CMU_CPUCL1 + PLL_CON0;
+	uint32_t v = rd(con);
+	wr(con, v & ~PLL_MUX_SEL);
+	uint64_t end = ticks() + TIMER_HZ / 100;
+	while (ticks() < end && (rd(con) & PLL_MUX_BUSY))
+		;
+	wr(con, rd(con) & ~PLL_EN);
+	wr(CMU_CPUCL1 + PLL_LOCKTIME, ((pms >> 8) & 0x3f) * 150);
+	wr(con, (rd(con) & ~PLL_PMS_MASK) | pms | PLL_EN);
+	end = ticks() + TIMER_HZ / 100;
+	while (ticks() < end && !(rd(con) & PLL_STABLE))
+		;
+	int ok = (rd(con) & PLL_STABLE) != 0;
+	if (ok)
+		wr(con, rd(con) | PLL_MUX_SEL);
+	return ok;
+}
+
+void pmic_cpu_boost(void)
+{
+	out("A53 boost");
+	show(" b3out", SLAVE_PMIC, B3OUT);
+	kv("cl1 pll", rd(CMU_CPUCL1 + PLL_CON0));
+	out("\n");
+	int vsel = speedy(SLAVE_PMIC, B3OUT, 0, 0);
+	if (vsel < 0 || vsel > BUCK_VSEL(1000000)) {
+		out("A53 boost skipped: BUCK3 unreadable or already high\n");
+		return;
+	}
+	uint32_t old = rd(CMU_CPUCL1 + PLL_CON0) & PLL_PMS_MASK;
+	if (vsel < BUCK_VSEL(950000)) {
+		speedy(SLAVE_PMIC, B3OUT, 1, BUCK_VSEL(950000));
+		delay_us(1000);
+	}
+	int ok = pll_set(PLL_PMS(223, 4, 0));
+	if (!ok)
+		pll_set(old);
+	out(ok ? "A53 boost ok" : "A53 boost FAILED, restored");
+	show(" b3out", SLAVE_PMIC, B3OUT);
+	kv("cl1 pll", rd(CMU_CPUCL1 + PLL_CON0));
+	out("\n");
+	cpu_freq();
 }

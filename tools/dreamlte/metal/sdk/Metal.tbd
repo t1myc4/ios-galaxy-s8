@@ -1,0 +1,10 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ arm64-ios ]
+install-name:    '/System/Library/Frameworks/Metal.framework/Metal'
+current-version: 306.6.6
+exports:
+  - targets:         [ arm64-ios ]
+    objc-classes:    [ _MTLDevice, _MTLObjectWithLabel, _MTLCommandQueue, _MTLCommandBuffer,
+                       _MTLCommandEncoder, _MTLResource, _MTLSamplerState, _MTLDepthStencilState ]
+...
