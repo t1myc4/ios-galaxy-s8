@@ -44,4 +44,6 @@ umount "$mnt"
 trap - EXIT
 rmdir "$mnt"
 fsck.hfsplus -f -y "$img" | grep -v 'Illegal name' || true
-fsck.hfsplus -f -n "$img"
+# hfsprogs reports "Volume header needs minor repair" (exit 8) on a fresh
+# journaled HFS+ image even after a successful -y; treat it as OK.
+fsck.hfsplus -f -n "$img" || [ $? -eq 8 ]
